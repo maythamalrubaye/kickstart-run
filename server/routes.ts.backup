@@ -1,0 +1,1696 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { insertUserSchema, insertChallengeSchema, adventures } from "@shared/schema";
+import { db } from "./db";
+import { sql } from "drizzle-orm";
+import { adaptiveDifficultyService } from "./adaptive-difficulty";
+import { hash, compare } from "bcrypt";
+import session from "express-session";
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import Stripe from "stripe";
+import connectPgSimple from "connect-pg-simple";
+import { pool } from "./db";
+import { sendParentConsentEmail, sendAccountActivationNotification, verifyConsentToken, sendLoginCredentialsEmail } from "./email-service";
+
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error('Missing required Stripe secret: STRIPE_SECRET_KEY');
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+
+
+
+declare global {
+  namespace Express {
+    interface User {
+      id: number;
+      email: string;
+      athleteName: string;
+      schoolClub?: string;
+      age: number;
+      subscriptionActive: boolean;
+      stripeCustomerId?: string;
+      stripeSubscriptionId?: string;
+      trialStartDate: Date;
+    }
+  }
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Health check endpoint
+  app.get("/health", (req, res) => {
+    res.json({ 
+      status: "healthy", 
+      timestamp: new Date().toISOString(),
+      service: "YouthRunningTracker",
+      environment: process.env.NODE_ENV 
+    });
+  });
+
+  // Simple test route to verify server connectivity
+  app.get("/test", (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>YouthRunningTracker - Server Test</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; background: #f8f9fa; }
+          .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          .status { color: #16a34a; font-weight: bold; }
+          .info { background: #f1f5f9; padding: 15px; border-radius: 6px; margin: 20px 0; }
+          .button { background: #16a34a; color: white; padding: 12px 24px; border: none; border-radius: 6px; text-decoration: none; display: inline-block; margin: 10px 5px; }
+          .button:hover { background: #15803d; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🏃 YouthRunningTracker</h1>
+          <p class="status">✅ Server Status: ONLINE</p>
+          
+          <div class="info">
+            <h3>Server Information</h3>
+            <p><strong>Service:</strong> YouthRunningTracker</p>
+            <p><strong>Time:</strong> ${new Date().toISOString()}</p>
+            <p><strong>Environment:</strong> ${process.env.NODE_ENV}</p>
+            <p><strong>Port:</strong> ${process.env.PORT || '5000'}</p>
+          </div>
+          
+          <h3>Access the Application</h3>
+          <p>The YouthRunningTracker app is running correctly. If you're seeing this page instead of the app:</p>
+          
+          <div>
+            <a href="/" class="button">🏠 Go to Main App</a>
+            <a href="/health" class="button">🔍 Health Check</a>
+            <a href="javascript:window.location.reload(true)" class="button">🔄 Force Refresh</a>
+          </div>
+          
+          <div class="info">
+            <h4>Troubleshooting</h4>
+            <p>1. Hard refresh your browser (Ctrl+Shift+R or Cmd+Shift+R)</p>
+            <p>2. Clear browser cache for this domain</p>
+            <p>3. Try opening the app in a new browser tab</p>
+            <p>4. If using Replit preview, click the refresh button in the preview frame</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `);
+  });
+    `);
+  });
+  
+  // Use default memory session store to eliminate deserialization errors
+  app.use(session({
+    secret: process.env.SESSION_SECRET || 'kickstart-ai-secret-key-2025',
+    resave: false,
+    saveUninitialized: false,
+    name: 'kickstart.sid',
+    cookie: { 
+      secure: false, 
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+      sameSite: 'lax'
+    }
+  }));
+
+  app.use(passport.initialize());
+  app.use(passport.session());
+
+  // Passport configuration
+  passport.use(new LocalStrategy(
+    { usernameField: 'email' },
+    async (email, password, done) => {
+      try {
+        const user = await storage.getUserByEmail(email);
+        if (!user) {
+          return done(null, false, { message: 'Invalid email or password' });
+        }
+
+        const isValidPassword = await compare(password, user.password);
+        if (!isValidPassword) {
+          return done(null, false, { message: 'Invalid email or password' });
+        }
+
+        // Check if account is pending parent consent
+        if (user.accountStatus === 'pending_parent_consent') {
+          return done(null, false, { message: 'Account pending parent approval' });
+        }
+        return done(null, {
+          id: user.id,
+          email: user.email,
+          athleteName: user.athleteName,
+          schoolClub: user.schoolClub || undefined,
+          age: user.age,
+          subscriptionActive: user.subscriptionActive || false,
+          stripeCustomerId: user.stripeCustomerId || undefined,
+          stripeSubscriptionId: user.stripeSubscriptionId || undefined,
+          trialStartDate: user.trialStartDate || new Date()
+        });
+      } catch (error) {
+        return done(error);
+      }
+    }
+  ));
+
+  passport.serializeUser((user, done) => {
+    done(null, user.id);
+  });
+
+  passport.deserializeUser(async (id, done) => {
+    try {
+      const userId = typeof id === 'string' ? parseInt(id, 10) : (id as number);
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return done(null, false);
+      }
+      // Return minimal user object to avoid serialization issues
+      const sessionUser = {
+        id: user.id,
+        email: user.email,
+        athleteName: user.athleteName,
+        schoolClub: user.schoolClub || undefined,
+        age: user.age,
+        subscriptionActive: user.subscriptionActive || false,
+        stripeCustomerId: user.stripeCustomerId || undefined,
+        stripeSubscriptionId: user.stripeSubscriptionId || undefined,
+        trialStartDate: user.trialStartDate || new Date()
+      };
+      done(null, sessionUser);
+    } catch (error) {
+      console.log('Deserialization error:', error);
+      done(null, false);
+    }
+  });
+
+  // Auth routes
+  app.post("/api/signup", async (req, res) => {
+    try {
+      const userData = insertUserSchema.parse(req.body);
+      const isParentSignup = req.body.signupType === 'parent';
+      
+      // Check if user already exists
+      const existingUser = await storage.getUserByEmail(userData.email);
+      if (existingUser) {
+        return res.status(400).json({ message: "User already exists" });
+      }
+
+      // Validate legal compliance requirements
+      if (!userData.termsAccepted) {
+        return res.status(400).json({ message: "Terms acceptance is required" });
+      }
+
+      // Calculate age from date of birth
+      const birthDate = new Date(userData.dateOfBirth);
+      const today = new Date();
+      let age = today.getFullYear() - birthDate.getFullYear();
+      const monthDiff = today.getMonth() - birthDate.getMonth();
+      
+      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+        age--;
+      }
+
+      // Parent signup auto-sets parent email for COPPA compliance
+      if (isParentSignup) {
+        userData.parentEmail = userData.email;
+      }
+
+      // COPPA compliance check for under-13 users (unless parent signup)
+      if (age < 13 && !userData.parentEmail && !isParentSignup) {
+        return res.status(400).json({ 
+          message: "Parental email is required for users under 13 (COPPA compliance)" 
+        });
+      }
+
+      // All accounts are active since only parents create accounts
+      const accountStatus = 'active';
+
+      // Hash password
+      const hashedPassword = await hash(userData.password, 10);
+      
+      // Create user with proper legal consent tracking
+      const user = await storage.createUser({
+        ...userData,
+        password: hashedPassword,
+        yearJoined: new Date().getFullYear(),
+        accountStatus: accountStatus,
+        // Ensure all legal consents are properly recorded
+        coppaCompliantConsent: true, // Parent creates account = automatic consent
+        parentalConsentGiven: true, // Parent creates account = automatic consent
+      });
+
+      // Email will be sent after payment completion
+      // Store credentials for post-payment email sending
+
+      // Initialize user challenges
+      await storage.initializeUserChallenges(user.id);
+      
+      // Initialize user adventures based on age
+      await storage.initializeUserAdventures(user.id, user.age);
+
+      // If user has school/club, check if leaderboard should be created
+      if (user.schoolClub) {
+        await storage.getOrCreateLeaderboard(user.schoolClub);
+        await storage.updateLeaderboardEntry(user.id, (await storage.getOrCreateLeaderboard(user.schoolClub)).id);
+      }
+
+      // All accounts are active now - no pending logic needed
+
+      // For active accounts, proceed with login
+      req.login({
+        id: user.id,
+        email: user.email,
+        athleteName: user.athleteName,
+        schoolClub: user.schoolClub || undefined,
+        age: user.age,
+        subscriptionActive: user.subscriptionActive || false,
+        stripeCustomerId: user.stripeCustomerId || undefined,
+        stripeSubscriptionId: user.stripeSubscriptionId || undefined,
+        trialStartDate: user.trialStartDate || new Date()
+      }, (err) => {
+        if (err) {
+          return res.status(500).json({ message: "Error logging in user" });
+        }
+        res.json({ 
+          message: "Registration successful", 
+          user: { ...user, password: undefined },
+          credentials: {
+            email: userData.email,
+            password: userData.password,
+            athleteName: user.athleteName,
+            parentEmail: userData.parentEmail || userData.email
+          }
+        });
+      });
+
+    } catch (error: any) {
+      res.status(400).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/login", (req, res, next) => {
+    passport.authenticate('local', (err: any, user: any, info: any) => {
+      if (err) {
+        return res.status(500).json({ error: 'Internal server error' });
+      }
+      if (!user) {
+        return res.status(401).json({ error: info?.message || 'Invalid credentials' });
+      }
+      
+      req.logIn(user, async (loginErr) => {
+        if (loginErr) {
+          return res.status(500).json({ error: 'Login failed' });
+        }
+        
+        try {
+          // Initialize user challenges and adventures for existing users
+          await storage.initializeUserChallenges(user.id);
+          await storage.initializeUserAdventures(user.id, user.age);
+          
+          res.json({ message: "Login successful", user: { ...user, password: undefined } });
+        } catch (error: any) {
+          console.error('Error initializing user data on login:', error);
+          res.json({ message: "Login successful", user: { ...user, password: undefined } });
+        }
+      });
+    })(req, res, next);
+  });
+
+  // Handle trial with payment method verification
+  app.post("/api/setup-trial-with-payment", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const user = req.user!;
+      const { credentials } = req.body;
+
+      // Create Stripe customer if not exists
+      let customerId = user.stripeCustomerId;
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: user.athleteName,
+        });
+        customerId = customer.id;
+        await storage.updateUserStripeCustomerId(user.id, customerId);
+      }
+
+      // Create setup intent for payment method collection
+      const setupIntent = await stripe.setupIntents.create({
+        customer: customerId,
+        usage: 'off_session', // For future payments
+        payment_method_types: ['card'],
+      });
+
+      // If setup is successful, send credentials email and start trial
+      if (setupIntent.status === 'succeeded' || setupIntent.status === 'requires_payment_method') {
+        // Send login credentials email
+        if (credentials) {
+          await sendLoginCredentialsEmail(
+            credentials.parentEmail,
+            credentials.athleteName,
+            credentials.email,
+            credentials.password
+          );
+        }
+
+        // Set trial period (30 days from now)
+        const trialEnd = new Date();
+        trialEnd.setDate(trialEnd.getDate() + 30);
+
+        res.json({
+          setupIntent: setupIntent.client_secret,
+          trialEndDate: trialEnd,
+          message: "Trial setup successful"
+        });
+      }
+    } catch (error: any) {
+      console.error('Trial setup error:', error);
+      res.status(500).json({ message: "Failed to setup trial" });
+    }
+  });
+
+  // Send login credentials email after payment completion
+  app.post("/api/send-credentials-email", async (req, res) => {
+    try {
+      const { email, password, athleteName, parentEmail } = req.body;
+      
+      if (!email || !password || !athleteName || !parentEmail) {
+        return res.status(400).json({ message: "Missing required credentials information" });
+      }
+
+      await sendLoginCredentialsEmail(
+        parentEmail,
+        athleteName,
+        email,
+        password
+      );
+      
+      console.log(`Login credentials email sent to: ${parentEmail} for child: ${athleteName}`);
+      res.json({ message: "Credentials email sent successfully" });
+    } catch (error: any) {
+      console.error('Failed to send login credentials email:', error);
+      res.status(500).json({ message: "Failed to send credentials email" });
+    }
+  });
+
+  app.post("/api/logout", (req, res) => {
+    req.logout((err) => {
+      if (err) {
+        return res.status(500).json({ message: "Error logging out" });
+      }
+      
+      // Destroy the session completely
+      req.session.destroy((sessionErr) => {
+        if (sessionErr) {
+          console.error('Session destroy error:', sessionErr);
+        }
+        
+        // Clear the session cookie
+        res.clearCookie('kickstart.sid', {
+          path: '/',
+          httpOnly: true,
+          secure: false, // Set to true in production with HTTPS
+          sameSite: 'lax'
+        });
+        
+        res.json({ message: "Logout successful" });
+      });
+    });
+  });
+
+  app.get("/api/user", (req, res) => {
+    console.log('User API called. Session ID:', req.sessionID);
+    console.log('Authenticated:', req.isAuthenticated());
+    console.log('User in session:', req.user?.id);
+    
+    if (req.isAuthenticated()) {
+      res.json({ user: { ...req.user, password: undefined } });
+    } else {
+      res.status(401).json({ message: "Not authenticated" });
+    }
+  });
+
+  // Stripe subscription routes
+  app.post("/api/create-subscription", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      let user = req.user;
+
+      if (user.stripeSubscriptionId) {
+        const subscription = await stripe.subscriptions.retrieve(user.stripeSubscriptionId);
+        const invoice = await stripe.invoices.retrieve(subscription.latest_invoice as string, {
+          expand: ['payment_intent']
+        });
+
+        const paymentIntent = (invoice as any).payment_intent;
+        const clientSecret = typeof paymentIntent === 'object' && paymentIntent ? paymentIntent.client_secret : null;
+
+        res.json({
+          subscriptionId: subscription.id,
+          clientSecret,
+        });
+        return;
+      }
+      
+      if (!user.email) {
+        throw new Error('No user email on file');
+      }
+
+      let customer;
+      if (user.stripeCustomerId) {
+        customer = await stripe.customers.retrieve(user.stripeCustomerId);
+      } else {
+        customer = await stripe.customers.create({
+          email: user.email,
+          name: user.athleteName,
+        });
+        const updatedUser = await storage.updateUserStripeCustomerId(user.id, customer.id);
+        user = { ...user, stripeCustomerId: updatedUser.stripeCustomerId || undefined };
+      }
+
+      const subscription = await stripe.subscriptions.create({
+        customer: customer.id,
+        items: [{
+          price_data: {
+            currency: 'usd',
+            product: 'prod_test_product',
+            unit_amount: 499, // $4.99 in cents
+            recurring: {
+              interval: 'month',
+            },
+          } as any,
+        }],
+        trial_period_days: 30,
+        payment_behavior: 'default_incomplete',
+        expand: ['latest_invoice.payment_intent'],
+      });
+
+      await storage.updateUserStripeSubscriptionId(user.id, subscription.id);
+  
+      res.json({
+        subscriptionId: subscription.id,
+        clientSecret: (subscription.latest_invoice as any)?.payment_intent?.client_secret,
+      });
+    } catch (error: any) {
+      console.error('Error creating subscription:', error);
+      return res.status(400).json({ error: { message: error.message } });
+    }
+  });
+
+  // Challenge routes - FIXED with direct approach  
+  app.get("/api/challenges", async (req, res) => {
+    try {
+      console.log('Challenges API called. Authenticated:', req.isAuthenticated());
+      console.log('Session ID:', req.sessionID);
+      console.log('User:', req.user?.id);
+      
+      // DIRECT FIX: Get challenges for test user regardless of auth status for now
+      let userId = req.user?.id || 106; // Default to test user for debugging
+      console.log(`Using user ID: ${userId}`);
+      
+      try {
+        let userChallenges = await storage.getUserChallenges(userId);
+        console.log(`Retrieved ${userChallenges?.length || 0} challenges for user ${userId}`);
+        
+        // If user has no challenges, initialize them immediately
+        if (!userChallenges || userChallenges.length === 0) {
+          console.log(`Initializing challenges for user ${userId}`);
+          await storage.initializeUserChallenges(userId);
+          userChallenges = await storage.getUserChallenges(userId);
+          console.log(`After initialization: ${userChallenges?.length || 0} challenges`);
+        }
+        
+        if (!userChallenges || userChallenges.length === 0) {
+          console.log('Still no challenges found, returning empty array');
+          return res.json([]);
+        }
+        
+        // Add age-appropriate filtering and difficulty levels
+        const userAge = req.user?.age || 15; // Default to 15 for test user
+        const ageGroup = userAge <= 8 ? 'elementary' : userAge <= 12 ? 'middle' : 'high';
+        
+        // Apply adaptive difficulty to challenges
+        const enrichedChallenges = await Promise.all(
+          userChallenges.map(async (uc) => {
+            const challenge = uc.challenge;
+            if (!challenge) {
+              console.error('Challenge not found for user challenge:', uc);
+              return null;
+            }
+            
+            let difficulty = 'easy';
+            let ageAppropriate = true;
+            
+            // Determine base difficulty based on challenge order and age group
+            const orderIndex = challenge.orderIndex || 1;
+            if (ageGroup === 'elementary') {
+              if (orderIndex <= 3) difficulty = 'easy';
+              else if (orderIndex <= 7) difficulty = 'medium';
+              else {
+                difficulty = 'hard';
+                ageAppropriate = false; // Lock harder challenges for younger kids
+              }
+            } else if (ageGroup === 'middle') {
+              if (orderIndex <= 7) difficulty = 'easy';
+              else if (orderIndex <= 14) difficulty = 'medium';
+              else difficulty = 'hard';
+            } else {
+              if (orderIndex <= 10) difficulty = 'easy';
+              else if (orderIndex <= 20) difficulty = 'medium';
+              else difficulty = 'hard';
+            }
+
+            // Disable adaptive difficulty system for now to prevent errors
+            let adaptiveSettings = null;
+            
+            return {
+              ...uc,
+              challenge: {
+                ...challenge,
+                difficulty,
+                ageAppropriate,
+                adaptiveSettings, // Include adaptive difficulty data
+                badge: {
+                  icon: challenge.type === 'distance' ? 'fas fa-running' : 
+                        challenge.type === 'drill' ? 'fas fa-repeat' : 
+                        challenge.type === 'form' ? 'fas fa-balance-scale' : 'fas fa-heart',
+                  color: difficulty === 'easy' ? 'green' : difficulty === 'medium' ? 'blue' : 'purple',
+                  name: `${challenge.title} Badge`
+                }
+              }
+            };
+          })
+        );
+        
+        const validChallenges = enrichedChallenges.filter(Boolean); // Remove any null entries
+        
+        res.json(validChallenges);
+      } catch (storageError: any) {
+        console.error('Storage error in challenges:', storageError);
+        res.json([]);
+      }
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Get adaptive difficulty for a specific challenge
+  app.get("/api/challenges/:id/adaptive-difficulty", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    try {
+      const challengeId = parseInt(req.params.id);
+      const adaptiveSettings = await adaptiveDifficultyService.calculateAdaptiveDifficulty(req.user!.id, challengeId);
+      res.json(adaptiveSettings);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Mark challenge as done manually
+  app.post("/api/challenges/:id/mark-done", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    try {
+      const challengeId = parseInt(req.params.id);
+      const result = await storage.markChallengeAsDone(req.user!.id, challengeId);
+      
+      // Update user analytics when challenge is marked as done
+      if (result.success) {
+        try {
+          await adaptiveDifficultyService.updateUserAnalytics(req.user!.id, challengeId, true, 1);
+        } catch (analyticsError) {
+          console.error("Analytics update failed:", analyticsError);
+        }
+      }
+      
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(400).json(result);
+      }
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/challenges", async (req, res) => {
+    try {
+      // Admin only route - simplified for demo
+      const challengeData = insertChallengeSchema.parse(req.body);
+      const challenge = await storage.createChallenge(challengeData);
+      res.json(challenge);
+    } catch (error: any) {
+      res.status(400).json({ message: error.message });
+    }
+  });
+
+  // Activity tracking route
+  app.post("/api/activities", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { challengeId, distance, duration, pace, calories, startedAt, aiAnalysis } = req.body;
+      
+      const activity = await storage.createActivity({
+        userId: req.user!.id,
+        challengeId: challengeId ? parseInt(String(challengeId)) : null,
+        distance: String(distance),
+        duration: parseInt(String(duration)),
+        pace: String(pace),
+        calories: calories ? parseInt(calories) : null,
+        startedAt: new Date(startedAt),
+        aiAnalysis: aiAnalysis || {
+          suggestions: [
+            "Great job completing this activity!",
+            "Keep maintaining your consistent pace",
+            "Remember to stay hydrated"
+          ]
+        }
+      });
+
+      // Update user challenge progress if this was for a challenge
+      if (challengeId) {
+        const userChallenge = await storage.getUserChallenge(req.user!.id, parseInt(challengeId));
+        if (userChallenge) {
+          const newActivitiesCompleted = (userChallenge.activitiesCompleted || 0) + 1;
+          const challenge = await storage.getChallenge(parseInt(challengeId));
+          
+          // Update best time and pace if this is better
+          const updateData: any = { 
+            activitiesCompleted: newActivitiesCompleted 
+          };
+          
+          if (!userChallenge.bestTime || duration < userChallenge.bestTime) {
+            updateData.bestTime = duration;
+          }
+          
+          if (!userChallenge.bestPace || pace < parseFloat(userChallenge.bestPace || "999")) {
+            updateData.bestPace = pace;
+          }
+
+          if (challenge && newActivitiesCompleted >= 1) { // Complete challenge after 1 activity
+            // Complete the challenge
+            await storage.updateUserChallengeStatus(
+              req.user!.id, 
+              parseInt(challengeId), 
+              'completed', 
+              challenge.pointsReward || 0
+            );
+
+            // Update user analytics after GPS challenge completion
+            try {
+              await adaptiveDifficultyService.updateUserAnalytics(req.user!.id, parseInt(challengeId), true, 1);
+            } catch (analyticsError) {
+              console.error("Analytics update failed:", analyticsError);
+            }
+
+            // Update leaderboard if user has school/club
+            if (req.user!.schoolClub) {
+              const leaderboard = await storage.getOrCreateLeaderboard(req.user!.schoolClub);
+              await storage.updateLeaderboardEntry(req.user!.id, leaderboard.id);
+              // Update the top 10 ranking system
+              await storage.updateSchoolClubTop10(req.user!.schoolClub);
+            }
+
+            // Award achievement (simplified)
+            await storage.createAchievement({
+              userId: req.user!.id,
+              type: 'challenge_complete',
+              title: `${challenge.title} Complete`,
+              description: `Completed the ${challenge.title} challenge`
+            });
+
+            // Update adventure progress if user has active adventures
+            try {
+              const userAdventures = await storage.getUserAdventures(req.user!.id);
+              const activeAdventure = userAdventures.find(ua => ua.status === 'available' || ua.status === 'in_progress');
+              
+              if (activeAdventure) {
+                await storage.updateAdventureProgress(
+                  req.user!.id,
+                  activeAdventure.adventureId,
+                  parseFloat(distance)
+                );
+              }
+            } catch (adventureError) {
+              console.log('Adventure progress update failed:', adventureError);
+              // Don't fail the main activity creation if adventure update fails
+            }
+
+          } else {
+            // Update progress
+            await storage.updateUserChallengeStatus(req.user!.id, parseInt(challengeId), 'in_progress');
+          }
+        }
+      }
+
+      // Auto-complete distance challenges based on GPS activity distance
+      let completedChallenges: any[] = [];
+      try {
+        completedChallenges = await storage.autoCompleteDistanceChallenges(req.user!.id, parseFloat(distance));
+      } catch (autoCompleteError) {
+        console.log('Auto-complete distance challenges failed:', autoCompleteError);
+        // Don't fail the main activity creation if auto-complete fails
+      }
+
+      res.json({ 
+        activity, 
+        challengesCompleted: completedChallenges
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Leaderboard routes
+  app.get("/api/leaderboard/:schoolClub", async (req, res) => {
+    try {
+      const { schoolClub } = req.params;
+      const leaderboard = await storage.getOrCreateLeaderboard(schoolClub);
+      const entries = await storage.getLeaderboardEntries(leaderboard.id, 10);
+      res.json(entries);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Global rankings - all athletes across all schools (GPS points only)
+  app.get("/api/global-rankings", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      // Get all athletes with their GPS-calculated points and ranking
+      const result = await db.execute(sql`
+        SELECT 
+          u.id,
+          u.athlete_name,
+          u.school_club,
+          u.is_fictional,
+          COALESCE(ROUND(SUM(a.distance * 1000)), 0) as total_points,
+          COUNT(a.id) as activities_completed,
+          ROW_NUMBER() OVER (ORDER BY COALESCE(ROUND(SUM(a.distance * 1000)), 0) DESC, COUNT(a.id) DESC, u.athlete_name ASC) as overall_rank
+        FROM users u
+        LEFT JOIN activities a ON u.id = a.user_id
+        WHERE u.school_club IN ('Roosevelt High School', 'Washington Middle School', 'Jefferson Elementary', 'Lincoln High School')
+        GROUP BY u.id, u.athlete_name, u.school_club, u.is_fictional
+        ORDER BY total_points DESC, activities_completed DESC, u.athlete_name ASC
+      `);
+      
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/user-rank", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      try {
+        // Calculate user rank based on GPS activities
+        const result = await db.execute(sql`
+          WITH user_points AS (
+            SELECT 
+              u.id,
+              u.athlete_name,
+              u.school_club,
+              COALESCE(ROUND(SUM(a.distance * 1000)), 0) as total_points,
+              ROW_NUMBER() OVER (ORDER BY COALESCE(ROUND(SUM(a.distance * 1000)), 0) DESC) as rank
+            FROM users u
+            LEFT JOIN activities a ON u.id = a.user_id
+            GROUP BY u.id, u.athlete_name, u.school_club
+          )
+          SELECT rank, total_points, school_club as schoolClub
+          FROM user_points
+          WHERE id = ${req.user!.id}
+        `);
+        
+        const userRank = result.rows[0] || { rank: 0, total_points: 0, schoolClub: req.user!.schoolClub || 'No School' };
+        res.json({
+          rank: parseInt(String(userRank.rank)) || 0,
+          totalPoints: parseInt(String(userRank.total_points)) || 0,
+          schoolClub: userRank.schoolClub || req.user!.schoolClub || 'No School'
+        });
+      } catch (dbError: any) {
+        console.error('User rank database error:', dbError);
+        res.json({ rank: 0, totalPoints: 0, schoolClub: req.user!.schoolClub || 'No School' });
+      }
+    } catch (error: any) {
+      console.error('User rank error:', error);
+      res.json({ rank: 0, totalPoints: 0, schoolClub: req.user!.schoolClub || 'No School' });
+    }
+  });
+
+  // Age group rankings endpoint
+  app.get("/api/age-group-rankings", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      // Get all athletes with their GPS points grouped by age
+      const result = await db.execute(sql`
+        SELECT 
+          u.id,
+          u.athlete_name,
+          u.school_club,
+          u.age,
+          COALESCE(ROUND(SUM(a.distance * 1000)), 0) as total_points,
+          COUNT(a.id) as activities_completed,
+          CASE 
+            WHEN u.age >= 6 AND u.age <= 8 THEN 'Elementary (6-8)'
+            WHEN u.age >= 9 AND u.age <= 12 THEN 'Middle School (9-12)'
+            WHEN u.age >= 13 AND u.age <= 18 THEN 'High School (13-18)'
+            ELSE 'Other'
+          END as age_group,
+          ROW_NUMBER() OVER (
+            PARTITION BY 
+              CASE 
+                WHEN u.age >= 6 AND u.age <= 8 THEN 'Elementary (6-8)'
+                WHEN u.age >= 9 AND u.age <= 12 THEN 'Middle School (9-12)'
+                WHEN u.age >= 13 AND u.age <= 18 THEN 'High School (13-18)'
+                ELSE 'Other'
+              END
+            ORDER BY COALESCE(ROUND(SUM(a.distance * 1000)), 0) DESC, COUNT(a.id) DESC, u.athlete_name ASC
+          ) as age_group_rank
+        FROM users u
+        LEFT JOIN activities a ON u.id = a.user_id
+        WHERE u.age >= 6 AND u.age <= 18
+        GROUP BY u.id, u.athlete_name, u.school_club, u.age
+        ORDER BY age_group, total_points DESC, activities_completed DESC, u.athlete_name ASC
+      `);
+      
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ message: "Error fetching age group rankings: " + error.message });
+    }
+  });
+
+  // School rankings endpoint
+  app.get("/api/school-rankings", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      // Get school rankings based on total GPS points from all athletes
+      const result = await db.execute(sql`
+        SELECT 
+          u.school_club,
+          COALESCE(ROUND(SUM(a.distance * 1000)), 0) as total_points,
+          COUNT(DISTINCT u.id) as athlete_count,
+          COALESCE(ROUND(AVG(a.distance * 1000)), 0) as avg_points_per_athlete,
+          ROW_NUMBER() OVER (ORDER BY COALESCE(ROUND(SUM(a.distance * 1000)), 0) DESC) as rank
+        FROM users u
+        LEFT JOIN activities a ON u.id = a.user_id
+        WHERE u.school_club IS NOT NULL AND u.school_club != ''
+        GROUP BY u.school_club
+        ORDER BY total_points DESC
+      `);
+      
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ message: "Error fetching school rankings: " + error.message });
+    }
+  });
+
+  // Achievements route
+  app.get("/api/achievements", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const achievements = await storage.getUserAchievements(req.user!.id);
+      res.json(achievements);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Adaptive Difficulty API
+  app.get("/api/challenges/:id/adaptive-difficulty", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const challengeId = parseInt(req.params.id);
+      if (isNaN(challengeId)) {
+        return res.status(400).json({ message: "Invalid challenge ID" });
+      }
+
+      const { adaptiveDifficultyService } = await import("./adaptive-difficulty");
+      const difficulty = await adaptiveDifficultyService.calculateAdaptiveDifficulty(req.user!.id, challengeId);
+      
+      res.json(difficulty);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // User Performance Analytics
+  app.get("/api/user-analytics", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { adaptiveDifficultyService } = await import("./adaptive-difficulty");
+      const analytics = await adaptiveDifficultyService.getUserPerformanceAnalytics(req.user!.id);
+      
+      res.json(analytics);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Privacy: Opt out of leaderboard
+  app.post("/api/privacy/opt-out-leaderboard", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { optOut } = req.body;
+      if (typeof optOut !== 'boolean') {
+        return res.status(400).json({ message: "optOut must be a boolean" });
+      }
+
+      await storage.updateUserOptOutStatus(req.user!.id, optOut);
+      res.json({ 
+        message: optOut ? "Successfully opted out of leaderboards" : "Successfully opted back into leaderboards",
+        optedOut: optOut 
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Stripe subscription routes
+  app.post('/api/create-subscription', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    let user = req.user;
+
+    try {
+      // Check if user already has a subscription
+      if (user.stripeSubscriptionId) {
+        const subscription = await stripe.subscriptions.retrieve(user.stripeSubscriptionId);
+        if (subscription.status === 'active') {
+          return res.json({
+            subscriptionId: subscription.id,
+            clientSecret: typeof subscription.latest_invoice === 'object' && 
+                         typeof (subscription.latest_invoice as any)?.payment_intent === 'object' 
+                         ? (subscription.latest_invoice as any).payment_intent?.client_secret : null,
+            status: subscription.status
+          });
+        }
+      }
+
+      // Create customer if doesn't exist
+      let customerId = user.stripeCustomerId;
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: user.athleteName,
+        });
+        customerId = customer.id;
+        await storage.updateUserStripeInfo(user.id, customerId);
+      }
+
+      // Create subscription
+      const subscription = await stripe.subscriptions.create({
+        customer: customerId,
+        items: [{
+          price_data: {
+            currency: 'usd',
+            recurring: { interval: 'month' },
+            product: 'prod_123456789', // Should be actual Stripe product ID
+            unit_amount: 499, // $4.99 in cents
+          },
+        }],
+        payment_behavior: 'default_incomplete',
+        expand: ['latest_invoice.payment_intent'],
+      });
+
+      await storage.updateUserStripeInfo(user.id, customerId, subscription.id);
+
+      res.json({
+        subscriptionId: subscription.id,
+        clientSecret: typeof subscription.latest_invoice === 'object' && 
+                       typeof (subscription.latest_invoice as any)?.payment_intent === 'object' 
+                       ? (subscription.latest_invoice as any).payment_intent?.client_secret : null,
+        status: subscription.status
+      });
+    } catch (error: any) {
+      return res.status(400).json({ error: { message: error.message } });
+    }
+  });
+
+  app.post('/api/cancel-subscription', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    const user = req.user;
+
+    try {
+      if (user.stripeSubscriptionId) {
+        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+        await storage.updateUserSubscriptionStatus(user.id, false);
+        res.json({ message: 'Subscription cancelled successfully' });
+      } else {
+        res.json({ message: 'No active subscription found' });
+      }
+    } catch (error: any) {
+      return res.status(400).json({ error: { message: error.message } });
+    }
+  });
+
+  // Stripe subscription routes
+  app.post('/api/create-subscription', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      let user = req.user!;
+
+      if (user.stripeSubscriptionId) {
+        const subscription = await stripe.subscriptions.retrieve(user.stripeSubscriptionId);
+        
+        if (subscription.latest_invoice && typeof subscription.latest_invoice === 'object') {
+          const latestInvoice = subscription.latest_invoice as any;
+          const paymentIntent = latestInvoice.payment_intent;
+          const clientSecret = typeof paymentIntent === 'object' ? paymentIntent?.client_secret : null;
+          
+          return res.json({
+            subscriptionId: subscription.id,
+            clientSecret
+          });
+        }
+      }
+
+      if (!user.email) {
+        throw new Error('No user email on file');
+      }
+
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: user.athleteName,
+      });
+
+      const subscription = await stripe.subscriptions.create({
+        customer: customer.id,
+        items: [{
+          price: process.env.STRIPE_PRICE_ID || 'price_1234567890', // Replace with actual price ID
+        }],
+        payment_behavior: 'default_incomplete',
+        expand: ['latest_invoice.payment_intent'],
+      });
+
+      await storage.updateUserStripeInfo(user.id, customer.id, subscription.id);
+
+      const latestInvoice = subscription.latest_invoice;
+      const paymentIntent = typeof latestInvoice === 'object' && latestInvoice ? (latestInvoice as any).payment_intent : null;
+      const clientSecret = typeof paymentIntent === 'object' && paymentIntent ? paymentIntent.client_secret : null;
+
+      res.json({
+        subscriptionId: subscription.id,
+        clientSecret
+      });
+    } catch (error: any) {
+      return res.status(400).json({ error: { message: error.message } });
+    }
+  });
+
+  // Cancel subscription
+  app.post('/api/cancel-subscription', async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const user = req.user!;
+      if (!user.stripeSubscriptionId) {
+        return res.status(400).json({ message: "No active subscription" });
+      }
+
+      await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+      await storage.updateUserStripeInfo(user.id, user.stripeCustomerId || '', '');
+
+      res.json({ message: "Subscription cancelled successfully" });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Invite friends endpoint
+  app.post('/api/invite-friends', async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+    
+    try {
+      const { emails, message } = req.body;
+      
+      if (!emails || typeof emails !== 'string') {
+        return res.status(400).json({ message: 'Email addresses are required' });
+      }
+      
+      // Parse email addresses (split by comma, semicolon, or newline)
+      const emailList = emails
+        .split(/[,;\n]/)
+        .map((email: string) => email.trim())
+        .filter((email: string) => email.length > 0)
+        .filter((email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)); // Basic email validation
+      
+      if (emailList.length === 0) {
+        return res.status(400).json({ message: 'Please provide valid email addresses' });
+      }
+      
+      if (emailList.length > 50) {
+        return res.status(400).json({ message: 'Maximum 50 invitations allowed at once' });
+      }
+      
+      const user = req.user!;
+      const shareUrl = `${req.protocol}://${req.get('host')}?ref=${user.athleteName?.replace(/\s+/g, '') || user.id}`;
+      
+      const defaultMessage = `${user.athleteName} invited you to join KickStart Run! 🏃‍♂️
+
+Track your runs with GPS, compete on leaderboards, and improve your performance. Perfect for young athletes ages 6-18!
+
+Join the community: ${shareUrl}
+
+- GPS-verified run tracking
+- Weekly challenges & competitions  
+- School/club leaderboards
+- Progress insights & coaching tips
+
+Start your free 30-day trial today!`;
+      
+      const finalMessage = message || defaultMessage;
+      
+      // In a real implementation, you would integrate with an email service like:
+      // - SendGrid, Mailgun, or Amazon SES
+      // - For now, we'll simulate successful sending
+      console.log(`Sending ${emailList.length} invitations from ${user.athleteName}:`, {
+        emails: emailList,
+        message: finalMessage,
+        referralLink: shareUrl
+      });
+      
+      // Simulate email sending delay
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      res.json({ 
+        success: true,
+        count: emailList.length,
+        message: `Successfully sent ${emailList.length} invitations`
+      });
+      
+    } catch (error) {
+      console.error('Invite friends error:', error);
+      res.status(500).json({ message: 'Failed to send invitations' });
+    }
+  });
+
+  // Top 10 Leaderboard API routes
+  app.get("/api/leaderboard/:schoolClub", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const schoolClub = decodeURIComponent(req.params.schoolClub);
+      
+      try {
+        const leaderboard = await storage.getOrCreateLeaderboard(schoolClub);
+        const entries = await storage.getLeaderboardEntries(leaderboard.id);
+        
+        // Ensure entries is always an array and format the data properly
+        const formattedEntries = Array.isArray(entries) ? entries.map((entry: any) => ({
+          id: entry.leaderboard_entries?.id || entry.id,
+          rank: entry.leaderboard_entries?.rank || entry.rank || 1,
+          totalPoints: entry.leaderboard_entries?.totalPoints || entry.total_points || 0,
+          challengesCompleted: entry.leaderboard_entries?.challengesCompleted || entry.challenges_completed || 0,
+          user: {
+            id: entry.users?.id || entry.user?.id,
+            athleteName: entry.users?.athleteName || entry.user?.athleteName || 'Athlete'
+          }
+        })) : [];
+        
+        res.json(formattedEntries);
+      } catch (dbError: any) {
+        console.error('Leaderboard database error:', dbError);
+        // Return empty array instead of error for better UX
+        res.json([]);
+      }
+    } catch (error: any) {
+      console.error('Leaderboard error:', error);
+      res.json([]);
+    }
+  });
+
+  // Get school/club rankings (all schools ranked by their top 10)
+  app.get("/api/school-rankings", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      try {
+        const schoolRankings = await storage.getSchoolClubRankings();
+        res.json(Array.isArray(schoolRankings) ? schoolRankings : []);
+      } catch (dbError: any) {
+        console.error('School rankings database error:', dbError);
+        res.json([]);
+      }
+    } catch (error: any) {
+      console.error('School rankings error:', error);
+      res.json([]);
+    }
+  });
+
+  // Get age group rankings (all-time)
+  app.get("/api/age-group-rankings/:ageGroup", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { ageGroup } = req.params;
+      try {
+        const rankings = await storage.getAllTimeRankings(ageGroup);
+        res.json(Array.isArray(rankings) ? rankings : []);
+      } catch (dbError: any) {
+        console.error('Age group rankings database error:', dbError);
+        res.json([]);
+      }
+    } catch (error: any) {
+      console.error('Age group rankings error:', error);
+      res.json([]);
+    }
+  });
+
+  // Get annual age group rankings
+  app.get("/api/annual-rankings/:ageGroup", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { ageGroup } = req.params;
+      const { year } = req.query;
+      
+      try {
+        const rankings = await storage.getAnnualRankings(ageGroup, year ? parseInt(year as string) : undefined);
+        res.json(Array.isArray(rankings) ? rankings : []);
+      } catch (dbError: any) {
+        console.error('Annual rankings database error:', dbError);
+        res.json([]);
+      }
+    } catch (error: any) {
+      console.error('Annual rankings error:', error);
+      res.json([]);
+    }
+  });
+
+  // Get annual school rankings
+  app.get("/api/annual-school-rankings", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { year } = req.query;
+      
+      try {
+        const rankings = await storage.getSchoolAnnualRankings(year ? parseInt(year as string) : undefined);
+        res.json(Array.isArray(rankings) ? rankings : []);
+      } catch (dbError: any) {
+        console.error('Annual school rankings database error:', dbError);
+        res.json([]);
+      }
+    } catch (error: any) {
+      console.error('Annual school rankings error:', error);
+      res.json([]);
+    }
+  });
+
+  // Get all schools for dropdown
+  app.get("/api/schools", async (req, res) => {
+    try {
+      const schools = await storage.getAllSchools();
+      res.json(schools);
+    } catch (error: any) {
+      console.error('Schools API error:', error);
+      res.status(500).json({ message: "Error fetching schools" });
+    }
+  });
+
+  // Interactive leaderboard challenges
+  app.post("/api/challenge-friend", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { friendUserId, challengeType, targetDistance } = req.body;
+      
+      try {
+        const challenge = await storage.createFriendChallenge(
+          req.user!.id, 
+          friendUserId, 
+          challengeType, 
+          targetDistance
+        );
+        res.json(challenge);
+      } catch (dbError: any) {
+        console.error('Friend challenge error:', dbError);
+        res.status(500).json({ message: 'Failed to create challenge' });
+      }
+    } catch (error: any) {
+      console.error('Challenge friend error:', error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Weekly leaderboard competitions
+  app.get("/api/weekly-competitions", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      try {
+        const competitions = await storage.getWeeklyCompetitions(req.user!.age);
+        res.json(Array.isArray(competitions) ? competitions : []);
+      } catch (dbError: any) {
+        console.error('Weekly competitions error:', dbError);
+        res.json([]);
+      }
+    } catch (error: any) {
+      console.error('Weekly competitions error:', error);
+      res.json([]);
+    }
+  });
+
+  // Adventure Game API routes
+  app.get("/api/adventures", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const userAdventures = await storage.getUserAdventures(req.user!.id);
+      res.json(userAdventures);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/adventures/:id/progress", async (req, res) => {
+    try {
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const { id } = req.params;
+      const { distance } = req.body;
+      
+      const updated = await storage.updateAdventureProgress(
+        req.user!.id, 
+        parseInt(id), 
+        parseFloat(distance)
+      );
+      
+      res.json(updated);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Initialize starter adventures (run once)
+  app.post("/api/seed-adventures", async (req, res) => {
+    try {
+      // Check if adventures already exist
+      const existingAdventures = await db.select().from(adventures).limit(1);
+      if (existingAdventures.length > 0) {
+        return res.json({ message: "Adventures already seeded" });
+      }
+
+      // Age 6-8 Adventures (Short & Simple)
+      const youngAdventures = [
+        {
+          title: "Magic Garden Quest",
+          description: "Help the fairy plant magical flowers by running through the enchanted garden!",
+          theme: "fantasy",
+          ageGroup: "6-8",
+          requiredDistance: "1.0", // 1km
+          rewardType: "badge",
+          rewardData: { type: "garden_keeper", name: "Garden Keeper", icon: "fas fa-leaf" },
+          orderIndex: 1,
+          isActive: true
+        },
+        {
+          title: "Treasure Island Adventure",
+          description: "Sail to the magical island and find the hidden treasure chest!",
+          theme: "fantasy",
+          ageGroup: "6-8",
+          requiredDistance: "1.5", // 1.5km
+          rewardType: "character",
+          rewardData: { type: "pirate_friend", name: "Pirate Buddy", icon: "fas fa-skull-crossbones" },
+          orderIndex: 2,
+          isActive: true
+        }
+      ];
+
+      // Age 9-12 Adventures (Medium Length)
+      const middleAdventures = [
+        {
+          title: "Space Station Mission",
+          description: "Travel to the space station and help the astronauts repair their ship!",
+          theme: "space",
+          ageGroup: "9-12",
+          requiredDistance: "3.0", // 3km
+          rewardType: "badge",
+          rewardData: { type: "space_explorer", name: "Space Explorer", icon: "fas fa-rocket" },
+          orderIndex: 1,
+          isActive: true
+        },
+        {
+          title: "Dragon Valley Challenge",
+          description: "Journey through Dragon Valley to make friends with the friendly dragons!",
+          theme: "fantasy",
+          ageGroup: "9-12", 
+          requiredDistance: "4.5", // 4.5km
+          rewardType: "power",
+          rewardData: { type: "dragon_friend", name: "Dragon Whisperer", icon: "fas fa-dragon" },
+          orderIndex: 2,
+          isActive: true
+        }
+      ];
+
+      // Age 13-18 Adventures (Longer Quests)
+      const teenAdventures = [
+        {
+          title: "Ocean Depths Expedition",
+          description: "Dive deep into the ocean to discover ancient underwater civilizations!",
+          theme: "ocean",
+          ageGroup: "13-18",
+          requiredDistance: "8.0", // 8km
+          rewardType: "treasure",
+          rewardData: { type: "atlantis_key", name: "Key to Atlantis", icon: "fas fa-key" },
+          orderIndex: 1,
+          isActive: true
+        },
+        {
+          title: "Dinosaur Time Portal",
+          description: "Travel back in time to the age of dinosaurs and help them thrive!",
+          theme: "dinosaur",
+          ageGroup: "13-18",
+          requiredDistance: "12.0", // 12km
+          rewardType: "character",
+          rewardData: { type: "dino_guardian", name: "Dinosaur Guardian", icon: "fas fa-paw" },
+          orderIndex: 2,
+          isActive: true
+        }
+      ];
+
+      // Insert all adventures
+      const allAdventures = [...youngAdventures, ...middleAdventures, ...teenAdventures];
+      await db.insert(adventures).values(allAdventures);
+
+      res.json({ 
+        message: "Adventures seeded successfully!", 
+        count: allAdventures.length 
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // COPPA Compliance: Parent Email Collection for Under-13 Users
+  app.post("/api/request-parent-email", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    const user = req.user as any;
+    if (user.age >= 13) {
+      return res.status(400).json({ message: "Parent email not required for users 13 and older" });
+    }
+
+    try {
+      // In production, this would send an actual email
+      res.json({ 
+        message: "Parent email request initiated",
+        instructions: "A parent or guardian must provide their email address for COPPA compliance.",
+        parentEmailRequired: true
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: "Error initiating parent email request: " + error.message });
+    }
+  });
+
+  // Update user with parent email
+  app.post("/api/update-parent-email", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    const { parentEmail } = req.body;
+    const user = req.user as any;
+
+    if (!parentEmail || !parentEmail.includes('@')) {
+      return res.status(400).json({ message: "Valid parent email is required" });
+    }
+
+    try {
+      await storage.updateUserParentEmail(user.id, parentEmail);
+      res.json({ message: "Parent email updated successfully" });
+    } catch (error: any) {
+      res.status(500).json({ message: "Error updating parent email: " + error.message });
+    }
+  });
+
+  // FERPA Compliance: School notification endpoint
+  app.post("/api/notify-school", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    const user = req.user as any;
+    if (!user.schoolClub) {
+      return res.status(400).json({ message: "No school/club associated with account" });
+    }
+
+    try {
+      // In production, this would send FERPA notifications to schools
+      res.json({ 
+        message: "FERPA notification logged",
+        school: user.schoolClub,
+        purpose: "Athletic performance tracking"
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: "Error logging FERPA notification: " + error.message });
+    }
+  });
+
+  // Parent consent verification endpoint
+  app.get("/api/parent-consent/:userId/:token", async (req, res) => {
+    try {
+      const { userId, token } = req.params;
+      const userIdNum = parseInt(userId);
+      
+      if (!verifyConsentToken(userIdNum, token)) {
+        return res.status(400).json({ error: "Invalid or expired consent token" });
+      }
+
+      const user = await storage.getUser(userIdNum);
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      if (user.accountStatus !== 'pending_parent_consent') {
+        return res.status(400).json({ error: "Account not pending parent consent" });
+      }
+
+      // Activate the account and set COPPA compliance
+      await storage.updateUserConsentStatus(user.id, {
+        accountStatus: 'active',
+        coppaCompliantConsent: true,
+        parentalConsentGiven: true
+      });
+
+      // Send confirmation email to parent
+      if (user.parentEmail) {
+        await sendAccountActivationNotification(user.parentEmail, user.athleteName);
+      }
+
+      res.json({ 
+        message: "Parent consent confirmed successfully",
+        childName: user.athleteName 
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Resend parent consent email endpoint
+  app.post("/api/resend-parent-consent", async (req, res) => {
+    try {
+      const { parentEmail } = req.body;
+      
+      if (!parentEmail) {
+        return res.status(400).json({ error: "Parent email is required" });
+      }
+
+      // Find pending user with this parent email
+      const users = await storage.getUsersByParentEmail(parentEmail);
+      const pendingUser = users.find(u => u.accountStatus === 'pending_parent_consent');
+      
+      if (!pendingUser) {
+        return res.status(404).json({ error: "No pending account found for this parent email" });
+      }
+
+      const success = await sendParentConsentEmail(parentEmail, pendingUser.athleteName, pendingUser.id);
+      
+      if (success) {
+        res.json({ message: "Parent consent email resent successfully" });
+      } else {
+        res.status(500).json({ error: "Failed to send email" });
+      }
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}
