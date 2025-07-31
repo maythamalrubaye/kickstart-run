@@ -44,6 +44,246 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
   });
 
+  // Download ACTUAL app AAB file endpoint  
+  app.get("/kickstart-run-release.aab", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'kickstart-run-ACTUAL.aab');
+    res.download(filePath, 'kickstart-run-ACTUAL.aab', (err) => {
+      if (err) {
+        console.error('Error downloading actual app AAB file:', err);
+        res.status(404).send('Actual app AAB file not found');
+      }
+    });
+  });
+
+  // Download page for ACTUAL app AAB file
+  app.get("/download-aab", async (req, res) => {
+    const { readFileSync, existsSync } = await import('fs');
+    const { join } = await import('path');
+    const htmlPath = join(process.cwd(), 'download-actual-app.html');
+    
+    if (existsSync(htmlPath)) {
+      res.sendFile(htmlPath);
+    } else {
+      res.status(404).send('Download page not found');
+    }
+  });
+
+  // Apple Store iPad screenshots
+  app.get("/apple-store-fixes", async (req, res) => {
+    const { readFileSync, existsSync } = await import('fs');
+    const { join } = await import('path');
+    const htmlPath = join(process.cwd(), 'apple-export-compliance-guide.html');
+    
+    if (existsSync(htmlPath)) {
+      res.sendFile(htmlPath);
+    } else {
+      res.status(404).send('Apple Store guide not found');
+    }
+  });
+
+  // Download iPad screenshots zip
+  app.get("/download-ipad-screenshots", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'ipad-screenshots-for-apple-store.zip');
+    res.download(filePath, 'ipad-screenshots-for-apple-store.zip', (err) => {
+      if (err) {
+        console.error('Error downloading iPad screenshots:', err);
+        res.status(404).send('Screenshots zip not found - please create screenshots first');
+      }
+    });
+  });
+
+  // Download Android AAB
+  app.get("/download-android-aab", async (req, res) => {
+    const { join } = await import('path');
+    const { existsSync } = await import('fs');
+    const aabFiles = [
+      'kickstart-run-FINAL.aab',           // Final working AAB
+      'kickstart-run-VALIDATED.aab',       // Previous attempt
+      'kickstart-run-FIXED.aab',           // Previous attempt
+      'kickstart-run-PROPER-ANDROID.aab',
+      'kickstart-run-ACTUAL.aab', 
+      'kickstart-run-complete.aab'
+    ];
+    
+    // Find the most recent AAB file
+    let aabFile = null;
+    for (const file of aabFiles) {
+      const filePath = join(process.cwd(), file);
+      if (existsSync(filePath)) {
+        aabFile = filePath;
+        break;
+      }
+    }
+    
+    if (aabFile) {
+      res.download(aabFile, 'kickstart-run-android.aab', (err) => {
+        if (err) {
+          console.error('Error downloading AAB:', err);
+          res.status(404).send('AAB download failed');
+        }
+      });
+    } else {
+      res.status(404).send('No AAB file found - please build Android app first');
+    }
+  });
+
+  // Android AAB download page
+  app.get("/android-aab-download", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'download-android-aab.html');
+    res.sendFile(filePath);
+  });
+
+  // Google Play troubleshooting guide
+  app.get("/google-play-troubleshooting", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'google-play-troubleshooting.html');
+    res.sendFile(filePath);
+  });
+
+  // GitHub Actions cloud build solution
+  app.get("/github-aab-build", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'github-aab-download.html');
+    res.sendFile(filePath);
+  });
+
+  // GitHub setup instructions
+  app.get("/github-setup-instructions.md", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'github-setup-instructions.md');
+    res.sendFile(filePath);
+  });
+
+  // Download GitHub workflow file
+  app.get("/github-workflow-download", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), '.github/workflows/build-android.yml');
+    res.download(filePath, 'build-android.yml');
+  });
+
+  // Download essential files page
+  app.get("/download-essential-files", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'download-essential-files.html');
+    res.sendFile(filePath);
+  });
+
+  // Upload guide
+  app.get("/upload-screenshots-guide.html", async (req, res) => {
+    const { join } = await import('path');
+    res.sendFile(join(process.cwd(), 'upload-screenshots-guide.html'));
+  });
+
+  // Simple upload interface
+  app.get("/simple-upload", async (req, res) => {
+    const { join } = await import('path');
+    const filePath = join(process.cwd(), 'simple-upload.html');
+    res.sendFile(filePath);
+  });
+
+  // Screenshot tool instructions
+  app.get("/ipad-screenshots", (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+          <title>iPad Screenshots for Apple App Store</title>
+          <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 40px; background: #f5f5f7; }
+              .container { max-width: 800px; margin: 0 auto; }
+              .screenshots { display: grid; gap: 20px; }
+              .screenshot-item { padding: 20px; background: white; border-radius: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+              .screenshot-link { color: #007aff; text-decoration: none; font-size: 18px; font-weight: 600; }
+              .screenshot-link:hover { text-decoration: underline; }
+              .instructions { background: #e3f2fd; padding: 25px; border-radius: 15px; margin-bottom: 30px; border: 1px solid #2196f3; }
+              h1 { color: #1d1d1f; text-align: center; }
+              h3 { color: #1d1d1f; margin-top: 0; }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <h1>📱 iPad Screenshots for Apple App Store</h1>
+              
+              <div class="instructions">
+                  <h3>Instructions for Real App Screenshots (2048x2732):</h3>
+                  <ol>
+                      <li><strong>Login:</strong> Use test@kickstartrun.com / TestPass123!</li>
+                      <li><strong>Browser Setup:</strong> Open Developer Tools → Device Mode → Set to 2048x2732</li>
+                      <li><strong>Navigate:</strong> Take screenshots of the 5 pages below</li>
+                      <li><strong>Save:</strong> Save each as PNG with exact filename shown</li>
+                      <li><strong>Download:</strong> Use download link to get zip file for Mac</li>
+                  </ol>
+              </div>
+              
+              <div class="screenshots">
+                  <div class="screenshot-item">
+                      <a href="/" class="screenshot-link" target="_blank">
+                          📊 Dashboard (/)
+                      </a>
+                      <p><strong>Save as:</strong> kickstart-run-ipad-dashboard-2048x2732.png</p>
+                      <small>Main dashboard with performance stats and activity overview</small>
+                  </div>
+                  
+                  <div class="screenshot-item">
+                      <a href="/activity-tracker" class="screenshot-link" target="_blank">
+                          🏃 Activity Tracker (/activity-tracker)
+                      </a>
+                      <p><strong>Save as:</strong> kickstart-run-ipad-activity-tracker-2048x2732.png</p>
+                      <small>GPS tracking interface with live activity monitoring</small>
+                  </div>
+                  
+                  <div class="screenshot-item">
+                      <a href="/challenges" class="screenshot-link" target="_blank">
+                          🏆 Challenges (/challenges)
+                      </a>
+                      <p><strong>Save as:</strong> kickstart-run-ipad-challenges-2048x2732.png</p>
+                      <small>Age-appropriate challenges and achievement system</small>
+                  </div>
+                  
+                  <div class="screenshot-item">
+                      <a href="/leaderboard" class="screenshot-link" target="_blank">
+                          🥇 Leaderboard (/leaderboard)
+                      </a>
+                      <p><strong>Save as:</strong> kickstart-run-ipad-leaderboard-2048x2732.png</p>
+                      <small>School and club rankings with privacy controls</small>
+                  </div>
+                  
+                  <div class="screenshot-item">
+                      <a href="/profile" class="screenshot-link" target="_blank">
+                          👤 Profile (/profile)
+                      </a>
+                      <p><strong>Save as:</strong> kickstart-run-ipad-profile-2048x2732.png</p>
+                      <small>Student athlete profile with COPPA compliance</small>
+                  </div>
+              </div>
+              
+              <div style="text-align: center; margin: 30px 0;">
+                  <a href="/upload-screenshots-guide.html" style="background: #28a745; color: white; padding: 15px 30px; border-radius: 10px; text-decoration: none; font-weight: bold; margin-right: 10px;">
+                      📤 Upload Screenshots
+                  </a>
+                  <a href="/download-ipad-screenshots" style="background: #007aff; color: white; padding: 15px 30px; border-radius: 10px; text-decoration: none; font-weight: bold;">
+                      📥 Download Zip
+                  </a>
+                  <p><small>Take screenshots → Upload them → Download zip for Apple Store</small></p>
+              </div>
+              
+              <div class="instructions">
+                  <h3>🚀 Next Steps After Screenshots:</h3>
+                  <ol>
+                      <li><strong>Export Compliance:</strong> Go to App Information → Export Compliance → Answer "No" to cryptography</li>
+                      <li><strong>Upload Screenshots:</strong> Add all 5 iPad screenshots to 13-inch iPad Display section</li>
+                      <li><strong>Submit:</strong> Review will start automatically once both issues are resolved</li>
+                  </ol>
+              </div>
+          </div>
+      </body>
+      </html>
+    `);
+  });
+
   // Privacy Policy route - Direct HTML for App Store submission
   app.get("/privacy", (req, res) => {
     res.send(`

@@ -43,6 +43,59 @@ app.get('/download-android-final', (req, res) => {
   res.download(filePath, 'FINAL-WORKING-android-build.tar.gz');
 });
 
+app.get('/download-ready-aab', (req, res) => {
+  const filePath = path.join(process.cwd(), 'kickstart-run-release.aab');
+  if (require('fs').existsSync(filePath)) {
+    res.download(filePath, 'kickstart-run-release.aab');
+  } else {
+    res.status(404).send('AAB file not ready yet. Please wait for cloud build to complete.');
+  }
+});
+
+app.get('/build-status', (req, res) => {
+  const fs = require('fs');
+  const aabExists = fs.existsSync(path.join(process.cwd(), 'kickstart-run-release.aab'));
+  res.json({ 
+    ready: aabExists,
+    message: aabExists ? 'AAB file is ready for download' : 'Build in progress...'
+  });
+});
+
+app.get('/download-github-workflow', (req, res) => {
+  res.sendFile(path.join(process.cwd(), 'download-github-workflow.html'));
+});
+
+app.get('/download-workflow-yml', (req, res) => {
+  const filePath = path.join(process.cwd(), '.github/workflows/build-android.yml');
+  res.download(filePath, 'build-android.yml');
+});
+
+app.get('/download-cloud-setup-md', (req, res) => {
+  const filePath = path.join(process.cwd(), 'CLOUD_BUILD_SETUP.md');
+  res.download(filePath, 'CLOUD_BUILD_SETUP.md');
+});
+
+app.get('/download-aab-page', (req, res) => {
+  res.sendFile(path.join(process.cwd(), 'download-aab-page.html'));
+});
+
+app.get('/create-aab', (req, res) => {
+  try {
+    require('child_process').execSync('node create-aab-file.js', { stdio: 'inherit' });
+    res.redirect('/download-aab-page');
+  } catch (error) {
+    res.status(500).send('Error creating AAB file');
+  }
+});
+
+app.get('/github-setup', (req, res) => {
+  res.sendFile(path.join(process.cwd(), 'github-setup-guide.html'));
+});
+
+app.get('/upload-guide', (req, res) => {
+  res.sendFile(path.join(process.cwd(), 'upload-instructions.html'));
+});
+
 app.get('/download-android-page', (req, res) => {
   res.send(`
     <!DOCTYPE html>
